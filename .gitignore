@@ -1,0 +1,5 @@
+build/
+vnctestserver
+*.o
+.verify/
+it_server.log
