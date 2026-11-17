@@ -33,6 +33,15 @@ left corner without scrolling.
 
 ## Quick start
 
+One line Docker command for testing in a sandbox:
+```
+docker run -it --rm ubuntu sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends git ca-certificates build-essential pkg-config libvncserver-dev libsixel-dev zlib1g-dev libjpeg-dev && git clone https://github.com/emchan/vnt /vnt && cd /vnt && make -j"$(nproc)" && exec bash'
+
+./vnt <hostname>
+```
+
+Standard Linux build:
+
 ```sh
 make
 ./vnt --check          # verify sixel support
