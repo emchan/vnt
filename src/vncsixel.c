@@ -30,6 +30,12 @@
 #include <unistd.h>
 #include <termios.h>
 
+#ifdef __linux__
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <linux/tcp.h>
+#endif
+
 #include <rfb/rfbclient.h>
 #include <rfb/keysym.h>
 #include <rfb/rfbconfig.h>
@@ -80,6 +86,25 @@ typedef struct {
 
     long last_update_ms;
 
+    /* Status bar / menu. */
+    int menu_enabled;   /* draw the bottom status bar */
+    int menu_rows;      /* rows reserved for it (1 by default) */
+    int refresh_x0, refresh_x1; /* clickable "Refresh" columns, 1-based */
+    int quit_x0, quit_x1;       /* clickable "Quit" columns, 1-based */
+    int menu_capture;           /* swallow drag until the mouse is released */
+    long last_menu_ms;
+
+    /* Statistics shown in the status bar. */
+    double fps;
+    double fps_window_start;
+    unsigned fps_frames;
+    double last_render_time;
+    unsigned long long net_total;      /* bytes received on the connection */
+    double net_rate;                   /* bytes per second */
+    unsigned long long net_sample_bytes;
+    long net_sample_ms;
+    int net_sample_valid;
+
     /* Framebuffer / connection diagnostics. */
     long connect_ms;
     unsigned long update_messages;
@@ -106,6 +131,7 @@ static int g_draw_cursor = 1;   /* draw a cursor on the image by default */
 static int g_calibrate = 0;
 static int g_stretch = 0;
 static int g_center = 0;
+static int g_no_menu = 0;
 static int g_mouse_offset_x = 0;
 static int g_mouse_offset_y = 0;
 
@@ -589,6 +615,307 @@ static double now_seconds(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* ------------------------------------------------------------------ */
+/* Status bar                                                         */
+/* ------------------------------------------------------------------ */
+
+static void format_rate(char *buf, size_t buflen, double bytes_per_second)
+{
+    if (bytes_per_second >= 1e9) {
+        snprintf(buf, buflen, "%.1f GB/s", bytes_per_second / 1e9);
+    } else if (bytes_per_second >= 1e6) {
+        snprintf(buf, buflen, "%.1f MB/s", bytes_per_second / 1e6);
+    } else if (bytes_per_second >= 1e3) {
+        snprintf(buf, buflen, "%.1f KB/s", bytes_per_second / 1e3);
+    } else {
+        snprintf(buf, buflen, "%.0f B/s", bytes_per_second);
+    }
+}
+
+static void format_size(char *buf, size_t buflen, double bytes)
+{
+    if (bytes >= 1e9) {
+        snprintf(buf, buflen, "%.1f GB", bytes / 1e9);
+    } else if (bytes >= 1e6) {
+        snprintf(buf, buflen, "%.1f MB", bytes / 1e6);
+    } else if (bytes >= 1e3) {
+        snprintf(buf, buflen, "%.1f KB", bytes / 1e3);
+    } else {
+        snprintf(buf, buflen, "%.0f B", bytes);
+    }
+}
+
+/*
+ * Refresh the connection statistics. Linux exposes the number of bytes the
+ * TCP socket has received through TCP_INFO; elsewhere (and on failure) fall
+ * back to the number of framebuffer pixels delivered by the server.
+ */
+static void update_stats(viewer_t *v, long nowms)
+{
+    unsigned long long bytes = 0;
+    int have_bytes = 0;
+    rfbClient *client = v->client;
+
+#if defined(__linux__) && defined(TCP_INFO)
+    if (client != NULL && client->sock >= 0) {
+        struct tcp_info ti;
+        socklen_t slen = sizeof(ti);
+
+        memset(&ti, 0, sizeof(ti));
+        if (getsockopt(client->sock, IPPROTO_TCP, TCP_INFO,
+                       &ti, &slen) == 0) {
+            bytes = (unsigned long long)ti.tcpi_bytes_received;
+            have_bytes = 1;
+        }
+    }
+#endif
+
+    if (!have_bytes) {
+        int bpp = 1;
+        if (client != NULL) {
+            bpp = client->format.bitsPerPixel / 8;
+            if (bpp < 1) {
+                bpp = 1;
+            }
+        }
+        bytes = v->pixels_received * (unsigned long long)bpp;
+    }
+
+    v->net_total = bytes;
+    if (!v->net_sample_valid) {
+        v->net_sample_valid = 1;
+        v->net_sample_bytes = bytes;
+        v->net_sample_ms = nowms;
+    } else if (nowms - v->net_sample_ms >= 500) {
+        double dt = (double)(nowms - v->net_sample_ms) / 1000.0;
+        if (dt > 0.0 && bytes >= v->net_sample_bytes) {
+            v->net_rate = (double)(bytes - v->net_sample_bytes) / dt;
+        }
+        v->net_sample_bytes = bytes;
+        v->net_sample_ms = nowms;
+    }
+
+    /* Let the frame rate decay when the remote desktop goes idle. */
+    if (v->last_render_time > 0.0 &&
+        nowms - (long)(v->last_render_time * 1000.0) > 1500) {
+        v->fps = 0.0;
+    }
+}
+
+/* Height of the image area in pixels, excluding the status bar row(s). */
+static int view_area_h(const viewer_t *v, const term_size_t *ts)
+{
+    int h = ts->pixel_h;
+
+    if (v->menu_enabled) {
+        h -= v->menu_rows * ts->cell_h;
+    }
+    if (h < 1) {
+        h = ts->pixel_h;
+    }
+    return h;
+}
+
+/*
+ * Draw the status bar on the last terminal row. The image is sized to end
+ * above it, so the text never covers the sixel graphic. Auto-wrap is off,
+ * so filling the whole row cannot scroll the screen.
+ */
+static void draw_menu(viewer_t *v)
+{
+    static const char refresh_label[] = "[ Refresh ]";
+    static const char quit_label[] = "[ Quit ^Q ]";
+    const int refresh_len = (int)sizeof(refresh_label) - 1;
+    const int quit_len = (int)sizeof(quit_label) - 1;
+    const int buttons = refresh_len + 1 + quit_len;
+    term_size_t ts;
+    rfbClient *client = v->client;
+    char host[192];
+    char enc[64];
+    char rate[32];
+    char total[32];
+    char tail_with_total[256];
+    char tail_no_total[256];
+    char info[512];
+    char line[1024];
+    size_t infolen, used = 0;
+    int width, btn_start = 1, info_avail = 0, i;
+    int host_budget;
+    int show_refresh = 1;
+    int host_prefix = (int)strlen(" host:");
+
+    if (!v->menu_enabled || v->out != stdout) {
+        return;
+    }
+
+    term_get_size(&ts);
+    width = ts.cols;
+    if (width < 1 || ts.rows < 1) {
+        return;
+    }
+
+    update_stats(v, now_ms());
+
+    if (client != NULL && client->serverHost != NULL) {
+        if (client->serverPort > 0 &&
+            strchr(client->serverHost, ':') == NULL) {
+            snprintf(host, sizeof(host), "%s:%d",
+                     client->serverHost, client->serverPort);
+        } else {
+            snprintf(host, sizeof(host), "%s", client->serverHost);
+        }
+    } else {
+        snprintf(host, sizeof(host), "unknown");
+    }
+
+    enc[0] = '\0';
+    if (client != NULL && client->appData.encodingsString != NULL) {
+        const char *p = client->appData.encodingsString;
+        size_t n = 0;
+        while (*p == ' ') {
+            p++;
+        }
+        while (*p != '\0' && *p != ' ' && n < sizeof(enc) - 1) {
+            enc[n++] = *p++;
+        }
+        enc[n] = '\0';
+    }
+    if (enc[0] == '\0') {
+        snprintf(enc, sizeof(enc), "unknown");
+    }
+
+    if (width >= buttons + 2) {
+        btn_start = width - buttons + 1;
+        info_avail = btn_start - 1;
+    } else {
+        /* Too narrow for both buttons: keep only Quit, which still exits. */
+        show_refresh = 0;
+        btn_start = width - quit_len + 1;
+        if (btn_start < 1) {
+            btn_start = 1;
+        }
+        info_avail = btn_start - 1;
+        if (info_avail < 0) {
+            info_avail = 0;
+        }
+    }
+
+    format_rate(rate, sizeof(rate), v->net_rate);
+    format_size(total, sizeof(total), (double)v->net_total);
+    snprintf(tail_with_total, sizeof(tail_with_total),
+             " | net:%s (%s) | enc:%s | fps:%.0f ",
+             rate, total, enc, v->fps);
+    snprintf(tail_no_total, sizeof(tail_no_total),
+             " | net:%s | enc:%s | fps:%.0f ", rate, enc, v->fps);
+
+    /*
+     * Keep encoding and fps visible on an 80-column terminal: shrink the
+     * hostname first, then drop the cumulative byte count.
+     */
+    host_budget = info_avail - host_prefix - (int)strlen(tail_with_total);
+    if (host_budget >= 12) {
+        snprintf(info, sizeof(info), " host:%s%s", host, tail_with_total);
+    } else {
+        host_budget = info_avail - host_prefix - (int)strlen(tail_no_total);
+        if (host_budget >= 1) {
+            char short_host[192];
+            int hlen = (int)strlen(host);
+
+            if (hlen <= host_budget) {
+                snprintf(short_host, sizeof(short_host), "%s", host);
+            } else if (host_budget == 1) {
+                snprintf(short_host, sizeof(short_host), "~");
+            } else {
+                snprintf(short_host, sizeof(short_host), "%.*s~",
+                         host_budget - 1, host);
+            }
+            snprintf(info, sizeof(info), " host:%s%s",
+                     short_host, tail_no_total);
+        } else {
+            snprintf(info, sizeof(info), "%s", tail_no_total);
+        }
+    }
+    infolen = strlen(info);
+
+    if (show_refresh) {
+        v->refresh_x0 = btn_start;
+        v->refresh_x1 = btn_start + refresh_len - 1;
+        v->quit_x0 = btn_start + refresh_len + 1;
+        v->quit_x1 = v->quit_x0 + quit_len - 1;
+    } else {
+        v->refresh_x0 = v->refresh_x1 = 0;
+        v->quit_x0 = btn_start;
+        v->quit_x1 = btn_start + quit_len - 1;
+    }
+
+    used += (size_t)snprintf(line + used, sizeof(line) - used,
+                             "\x1b[%d;1H\x1b[44;97m", ts.rows);
+    for (i = 0; i < info_avail && used < sizeof(line) - 1; i++) {
+        line[used++] = (i < (int)infolen) ? info[i] : ' ';
+    }
+    if (used >= sizeof(line)) {
+        used = sizeof(line) - 1;
+    }
+    if (show_refresh) {
+        used += (size_t)snprintf(line + used, sizeof(line) - used,
+                                 "\x1b[42;30m%s\x1b[44;97m ", refresh_label);
+        if (used >= sizeof(line)) {
+            used = sizeof(line) - 1;
+        }
+    }
+    used += (size_t)snprintf(line + used, sizeof(line) - used,
+                             "\x1b[41;97m%s\x1b[0m", quit_label);
+    if (used >= sizeof(line)) {
+        used = sizeof(line) - 1;
+    }
+    term_write(line, used);
+
+    v->last_menu_ms = now_ms();
+}
+
+/*
+ * Handle a mouse event that lands on the status bar. Returns 1 when the
+ * event was consumed by the bar (so it must not reach the remote desktop).
+ */
+static int handle_menu_event(viewer_t *v, const term_event_t *ev)
+{
+    term_size_t ts;
+
+    if (!v->menu_enabled || v->out != stdout) {
+        return 0;
+    }
+
+    if (v->menu_capture) {
+        if (!ev->pressed) {
+            v->menu_capture = 0;
+        }
+        return 1;
+    }
+
+    term_get_size(&ts);
+    if (ev->y != ts.rows) {
+        return 0;
+    }
+
+    if (ev->pressed && (ev->button_mask & 1)) {
+        v->menu_capture = 1;
+        if (v->refresh_x1 > 0 &&
+            ev->x >= v->refresh_x0 && ev->x <= v->refresh_x1) {
+            if (v->client != NULL) {
+                SendFramebufferUpdateRequest(v->client, 0, 0,
+                                             v->client->width,
+                                             v->client->height, FALSE);
+                v->black_checked = 0;
+            }
+        } else if (ev->x >= v->quit_x0 && ev->x <= v->quit_x1) {
+            g_interrupted = 1;
+        }
+    }
+
+    /* Swallow presses, releases and wheel events over the bar. */
+    return 1;
+}
+
 static int ensure_buffers(viewer_t *v, int fb_w, int fb_h, int tw, int th)
 {
     size_t need_rgb = (size_t)fb_w * (size_t)fb_h * 3;
@@ -753,6 +1080,7 @@ static int render(viewer_t *v, int upscale)
     int fb_h = client->height;
     double sx, sy, s;
     int tw, th;
+    int avail_h;
 
     if (fb_w <= 0 || fb_h <= 0 || client->frameBuffer == NULL) {
         return -1;
@@ -763,6 +1091,8 @@ static int render(viewer_t *v, int upscale)
         return -1;
     }
 
+    avail_h = view_area_h(v, &ts);
+
     if (g_stretch) {
         /*
          * Stretch the remote desktop to fill the whole terminal pixel area.
@@ -770,7 +1100,7 @@ static int render(viewer_t *v, int upscale)
          * terminal grid coincide exactly, which simplifies mouse mapping.
          */
         tw = ts.pixel_w;
-        th = ts.pixel_h;
+        th = avail_h;
         if (tw < 1) {
             tw = 1;
         }
@@ -785,7 +1115,7 @@ static int render(viewer_t *v, int upscale)
          * times the (possibly estimated) cell size.
          */
         sx = (double)ts.pixel_w / (double)fb_w;
-        sy = (double)ts.pixel_h / (double)fb_h;
+        sy = (double)avail_h / (double)fb_h;
         s = (sx < sy) ? sx : sy;
         if (!upscale && s > 1.0) {
             s = 1.0;
@@ -805,8 +1135,8 @@ static int render(viewer_t *v, int upscale)
         if (tw > ts.pixel_w) {
             tw = ts.pixel_w;
         }
-        if (th > ts.pixel_h) {
-            th = ts.pixel_h;
+        if (th > avail_h) {
+            th = avail_h;
         }
     }
 
@@ -969,7 +1299,7 @@ static int render(viewer_t *v, int upscale)
      */
     if (g_center && v->out == stdout) {
         int ox = (ts.pixel_w - tw) / 2;
-        int oy = (ts.pixel_h - th) / 2;
+        int oy = (avail_h - th) / 2;
         int col = ox / ts.cell_w + 1;
         int row = oy / ts.cell_h + 1;
         char buf[64];
@@ -991,6 +1321,23 @@ static int render(viewer_t *v, int upscale)
         return -1;
     }
     fflush(v->out);
+
+    /* Update the frame-rate statistic and refresh the status bar. */
+    {
+        double t = now_seconds();
+
+        v->fps_frames++;
+        if (v->fps_window_start <= 0.0) {
+            v->fps_window_start = t;
+        } else if (t - v->fps_window_start >= 0.5) {
+            double dt = t - v->fps_window_start;
+            v->fps = (double)v->fps_frames / dt;
+            v->fps_frames = 0;
+            v->fps_window_start = t;
+        }
+        v->last_render_time = t;
+    }
+    draw_menu(v);
 
     /*
      * The crosshair drawn above is the local cursor: it is rendered on the
@@ -1051,7 +1398,7 @@ static void send_mouse(viewer_t *v, const term_event_t *ev)
          */
         if (g_center) {
             ox = (ts.pixel_w - v->img_w) / 2;
-            oy = (ts.pixel_h - v->img_h) / 2;
+            oy = (view_area_h(v, &ts) - v->img_h) / 2;
         }
         ipx = px - ox;
         ipy = py - oy;
@@ -1165,6 +1512,7 @@ static void usage(void)
         "                          aspect ratio; simplifies mouse mapping)\n"
         "      --center            centre the image in the terminal instead of\n"
         "                          top-left aligning it\n"
+        "      --no-menu           do not draw the status bar at the bottom\n"
         "      --check             report whether the terminal supports sixel and exit\n"
         "      --frames N         exit after N frames (for testing)\n"
         "  -h, --help             this message\n");
@@ -1243,6 +1591,8 @@ int main(int argc, char **argv)
             g_stretch = 1;
         } else if (strcmp(a, "--center") == 0) {
             g_center = 1;
+        } else if (strcmp(a, "--no-menu") == 0) {
+            g_no_menu = 1;
         } else if (strcmp(a, "--cell-size") == 0) {
             int cw = 0, ch = 0;
             if (i + 1 >= argc) { usage(); return 1; }
@@ -1320,6 +1670,9 @@ int main(int argc, char **argv)
     }
 
     v.ppm_path = ppm_path;
+    v.menu_enabled = (dump_path == NULL && !g_no_menu &&
+                      isatty(STDOUT_FILENO));
+    v.menu_rows = 1;
 
     if (g_safe_mode) {
         if (!encodings_set) {
@@ -1572,6 +1925,10 @@ int main(int argc, char **argv)
     }
 
     /* ---- main loop ---- */
+    if (v.menu_enabled) {
+        draw_menu(&v);
+    }
+
     if (ensure_row_seen(&v, v.client->height) != 0) {
         fprintf(stderr, PROG ": out of memory\n");
         sixel_sink_destroy(&v.sink);
@@ -1590,17 +1947,24 @@ int main(int argc, char **argv)
         }
 
         /* Handle terminal input. */
-        if (!view_only && dump_path == NULL) {
+        if (dump_path == NULL) {
             while (term_poll_event(&ev)) {
                 if (ev.kind == TERM_EV_KEY) {
-                    if (ev.keysym == 0x03) { /* Ctrl-C */
+                    if (ev.keysym == 0x11) { /* Ctrl-Q quits */
                         g_interrupted = 1;
                         break;
                     }
-                    SendKeyEvent(v.client, ev.keysym, TRUE);
-                    SendKeyEvent(v.client, ev.keysym, FALSE);
+                    if (!view_only) {
+                        SendKeyEvent(v.client, ev.keysym, TRUE);
+                        SendKeyEvent(v.client, ev.keysym, FALSE);
+                    }
                 } else if (ev.kind == TERM_EV_MOUSE) {
-                    send_mouse(&v, &ev);
+                    if (handle_menu_event(&v, &ev)) {
+                        continue;
+                    }
+                    if (!view_only) {
+                        send_mouse(&v, &ev);
+                    }
                 }
             }
         }
@@ -1643,6 +2007,11 @@ int main(int argc, char **argv)
 
         now = now_seconds();
         nowms = now_ms();
+
+        /* Keep the clock / bandwidth / fps readout live while idle. */
+        if (v.menu_enabled && nowms - v.last_menu_ms >= 500) {
+            draw_menu(&v);
+        }
 
         if (v.client->height != v.row_seen_cap) {
             /* The remote desktop was resized. */

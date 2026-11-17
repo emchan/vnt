@@ -79,9 +79,9 @@ def main():
                 sent_key = True
 
             if sent_key and len(out) > 20000:
-                # Ctrl-C quits the client; keep reading so that we also
+                # Ctrl-Q quits the client; keep reading so that we also
                 # capture the terminal restore sequences.
-                os.write(fd, b"\x03")
+                os.write(fd, b"\x11")
                 quitting = True
                 quit_deadline = time.time() + 2.0
 
@@ -100,6 +100,8 @@ def main():
             ("mouse tracking off", CSI + b"?1002l"),
             ("cursor shown", CSI + b"?25h"),
             ("alternate screen off", CSI + b"?1049l"),
+            ("status bar refresh button", b"[ Refresh ]"),
+            ("status bar quit button", b"[ Quit ^Q ]"),
         ]
 
         failed = 0

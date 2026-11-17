@@ -88,7 +88,8 @@ in 1.8.7-r2 emits plain DCS envelopes without the `tmux;` prefix.
 
 * `term_init()` switches to raw mode, the alternate screen, hides the cursor,
   enables DECSDM (`ESC [ ? 80 h`), requests the shared colour palette
-  (`ESC [ ? 1070 l`) and (optionally) SGR mouse reporting.
+  (`ESC [ ? 1070 l`), disables auto-wrap (`ESC [ ? 7 l`, so the bottom status
+  bar cannot scroll the screen) and (optionally) SGR mouse reporting.
 * `term_get_size()` derives the drawable pixel area from `TIOCGWINSZ`, falling
   back to 8x16 cells when the terminal reports no pixel size (the common case).
 * `term_poll_event()` decodes keyboard and SGR mouse events from a persistent
@@ -107,6 +108,12 @@ because it also fires for pseudo-encoding-only messages).
 The event loop waits on `WaitForMessage`, handles RFB messages, polls
 terminal input and forwards it, and draws a frame when the row coverage is
 complete (or when the server went quiet for 200 ms).
+
+The bottom terminal row is reserved for a status bar. `render()` sizes the
+image to fit above it, and `draw_menu()` redraws the bar (host, bandwidth,
+encoding, fps, Refresh and Quit buttons) every frame and twice a second while
+idle. Mouse events on that row are intercepted and never reach the server;
+`Ctrl-Q` disconnects while `Ctrl-C` is forwarded to the remote desktop.
 
 ## 4. How it was constructed
 
@@ -252,16 +259,18 @@ the terminal on exit.
 **How:** run the client through a pseudo terminal with a window size of
 80x24 cells (8x16 pixels each) and capture the raw bytes.
 
-**Assertions:** 11 specific byte sequences must be present:
+**Assertions:** the terminal control sequences must be present:
 * `ESC [ ? 1049 h` (alternate screen on)
 * `ESC [ ? 25 l` (cursor hidden)
 * `ESC [ ? 80 h` (sixel display mode — image at top left, cursor unmoved)
 * `ESC [ ? 1070 l` (shared colour registers — required for body-only)
+* `ESC [ ? 7 l` (auto-wrap disabled for the status bar)
 * `ESC [ ? 1002 h` (mouse tracking on)
 * `ESC P q` (SIXEL DCS start)
 * `ESC \ ` (SIXEL DCS terminator)
 * `ESC [ ? 1002 l`, `ESC [ ? 1006 l`, `ESC [ ? 1000 l` (mouse tracking off)
-* `ESC [ ? 80 l`, `ESC [ ? 25 h`, `ESC [ ? 1049 l` (restore)
+* `ESC [ ? 7 h`, `ESC [ ? 80 l`, `ESC [ ? 25 h`, `ESC [ ? 1049 l` (restore)
+* the status bar labels `[ Refresh ]` and `[ Quit ^Q ]`
 * raster attributes `ESC P q "1;1;W;H` (square pixels)
 * at least one sixel frame emitted
 
@@ -274,18 +283,23 @@ coordinates.
 **How:**
 1. Start `vnctestserver` (640x480, 10 fps, animated).
 2. Run the client through a pseudo terminal.
-3. Wait for several sixel frames, then send a mouse press (SGR `ESC [ < 0 ; 10 ; 5 M`)
-   and a key (`a`).
+3. Wait for several sixel frames, then send a mouse press (SGR `ESC [ < 0 ; 10 ; 5 M`),
+   the `a` and Backspace keys, and `Ctrl-C`, then click the Refresh and Quit
+   buttons in the bottom status bar.
 4. Parse the server's stderr for the logged events.
 
 **Assertions:**
 * at least 3 sixel frames received
 * at least 2 distinct frames (the desktop animates)
 * the server logged `key down keysym=0x61`
-* the server logged `pointer mask=1 at (95,90)` — cell (10,5) of an
-  80x24 terminal (8x16 cells) is image pixel (76,72), which maps back
-  through the 512x384 image to remote pixel (95,90). This exercises both
-  the downscale and the inverse coordinate transform.
+* the server logged `key down keysym=0xff08` (Backspace remapped)
+* the server logged `key down keysym=0x3` (Ctrl-C forwarded, not a quit)
+* the Quit button exits the client
+* the server logged `pointer mask=1 at (99,93)` — cell (10,5) of an
+  80x24 terminal (8x16 cells) with one row reserved for the status bar is
+  image pixel (76,72), which maps back through the 490x368 image to remote
+  pixel (99,93). This exercises both the downscale and the inverse
+  coordinate transform.
 
 ### 6.5 `verify_resize.py` — terminal resize handling
 

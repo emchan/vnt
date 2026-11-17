@@ -52,7 +52,8 @@ Dependencies: libvncclient, libsixel, zlib, libjpeg (for tight encoding).
 
 ```sh
 make
-make PREFIX=/usr/local   # for a system install
+sudo make install                      # installs vnt to /usr/local/bin
+make install BINDIR=$HOME/.local/bin   # alternative destination
 ```
 
 ```sh
@@ -75,6 +76,7 @@ vnt [options] host[:port]
                           ratio; simplifies mouse mapping)
       --center            centre the image in the terminal instead of
                           top-left aligning it
+      --no-menu           do not draw the status bar at the bottom
   -v, --view-only        do not send keyboard or mouse events
       --tmux             wrap the sixel output for tmux passthrough
       --full-palette     re-send the colour palette every frame (default)
@@ -178,6 +180,15 @@ are mapped from terminal cells back into remote framebuffer coordinates
 through the same scale transform that is used for the image, so they land on
 the pixel under the pointer. Mouse reporting uses the SGR extended mode so
 that coordinates larger than 223 work.
+
+The bottom row is a status bar showing the connected host, the network
+bandwidth in use (and total received), the encoding requested from the
+server, and the current frame rate. Click **[ Refresh ]** to request a full
+non-incremental framebuffer update, or **[ Quit ^Q ]** to disconnect. The
+same actions are available from the keyboard with `Ctrl-Q`; `Ctrl-C` is
+forwarded to the remote desktop, so it works as copy in applications that
+use it. Use `--no-menu` to hide the bar (the image then uses the full
+terminal height).
 
 A local cursor is shown at the last mouse position so the user can see
 where clicks will land. By default two crosshairs are drawn on the image:

@@ -3,7 +3,12 @@
 # The libraries can be picked up either from pkg-config or from a plain
 # prefix. Override PREFIX if libvncclient / libsixel live somewhere else:
 #
-#   make PREFIX=/usr/local
+#   make PREFIX=/opt/libvnc
+#
+# Install the binary with:
+#
+#   make install                      # /usr/local/bin
+#   make install BINDIR=$HOME/.local/bin
 #
 # Run the end to end test with:
 #
@@ -13,6 +18,7 @@ PROG        := vnt
 TESTPROG    := vnctestserver
 
 PREFIX      ?= /tmp/opencode/install
+BINDIR      ?= /usr/local/bin
 PKG_CONFIG  ?= pkg-config
 
 CC          ?= cc
@@ -52,7 +58,7 @@ OBJDIR := build
 CLIENT_OBJS := $(OBJDIR)/vncsixel.o $(OBJDIR)/scaler.o $(OBJDIR)/sixel_out.o $(OBJDIR)/terminal.o
 SERVER_OBJS := $(OBJDIR)/vnctestserver.o
 
-.PHONY: all clean test
+.PHONY: all clean test install uninstall
 
 all: $(PROG) $(TESTPROG)
 
@@ -79,6 +85,13 @@ $(OBJDIR)/vnctestserver.o:  tests/vnctestserver.c
 
 clean:
 	rm -rf $(OBJDIR) $(PROG) $(TESTPROG)
+
+install: $(PROG)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(PROG) $(DESTDIR)$(BINDIR)/$(PROG)
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(PROG)
 
 test: all
 	./tests/run_e2e.sh

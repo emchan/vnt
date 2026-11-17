@@ -26,15 +26,19 @@
  *            to re-send its colour register definitions.
  *  ?1002h    button event tracking mouse reporting
  *  ?1006h    SGR extended mouse reporting (so coordinates can exceed 223)
+ *  ?7l       disable auto-wrap, so writing the status bar on the last
+ *            row cannot scroll the screen
  */
 #define TERM_ENTER_GRAPHICS \
     "\x1b[?1049h"  /* alternate screen */ \
     "\x1b[?25l"    /* hide cursor */    \
     "\x1b[?80h"    /* sixel display mode */ \
-    "\x1b[?1070l"  /* shared colour registers */
+    "\x1b[?1070l"  /* shared colour registers */ \
+    "\x1b[?7l"     /* no auto-wrap */
 
 #define TERM_LEAVE_GRAPHICS \
     "\x1b[?1002l\x1b[?1006l\x1b[?1000l"  /* mouse reporting off */ \
+    "\x1b[?7h"     /* auto-wrap back on */ \
     "\x1b[?80l"    /* sixel scrolling mode */ \
     "\x1b[?25h"    /* show cursor */ \
     "\x1b[?1049l"  /* leave alternate screen */
