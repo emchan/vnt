@@ -10,7 +10,7 @@ graphics**. The whole pipeline is:
 remote desktop
    │  RFB
    ▼
-libvncclient  →  32 bpp framebuffer
+libvncclient  →  framebuffer (16/32 bpp)
                       │
                       ▼
               fb_to_rgb24()  (any rfbPixelFormat -> RGB24)
@@ -91,7 +91,74 @@ vnt [options] host[:port]
       --cell-size W,H     override the terminal cell size in pixels
       --calibrate         draw a green grid + red/blue markers to verify image
                           position
-  -V, --verbose          print scaling information
+  -U, --user NAME        user name for servers that need VeNCrypt/MS-Logon/
+                         ARD credentials (the password is prompted for)
+      --server-format    also accept the server's native 16bpp format
+                         (native 32bpp is already preferred automatically)
+      --safe-mode        debugging profile: raw encoding, server-native pixel
+                         format, JPEG/compression disabled
+  -V, --verbose          print scaling, connection and negotiation details
+```
+
+### Connection troubleshooting
+
+`-V` turns on a full transcript of the RFB negotiation. libvncclient reports
+the protocol version, every security type offered by the server, which one
+was selected, and whether authentication succeeded. `vnt` adds the negotiated
+security scheme, the server and client pixel formats, and the encodings that
+were requested, so the failing step is visible.
+
+Typical failures:
+
+* **`Unable to connect to VNC server`** before any protocol line: the TCP
+  connection failed. Check the host/port, DNS, and firewall.
+* **A protocol-version line but no selected security type**: the server only
+  offers a security type this client cannot use (or offers none). Look at the
+  `Received security type` lines.
+* **`GetCredential callback is not set`**: the server only offers
+  VeNCrypt/MS-Logon/Apple Remote Desktop, which need a user name as well as a
+  password. Retry with `--user NAME`.
+* **Authentication failure after the password prompt**: the password (or
+  user name) was rejected. Check credentials and the server's authentication
+  method. The client prints hints after a failed `rfbInitClient()` call.
+* **X.509 credentials requested**: this client does not implement client
+  certificates; use a server that offers VNC/VeNCrypt/Plain authentication.
+* **The image is black**: `vnt` now checks completed frames and reports whether
+  the framebuffer is effectively black. It also advertises the classic
+  `NewFBSize` pseudo-encoding, which keeps TightVNC off its full-screen
+  fallback path, and forces a full refresh up to twice, because a corrupted
+  first frame would otherwise stay black until the desktop changes. If the
+  warning persists, try `-e raw` to bypass the Tight/ZRLE decoders and
+  `--dump-ppm frame.ppm` to inspect what the server actually sent. `-V` also
+  logs the server's native pixel format
+  and raw pixel samples. The warning after the retries states which of the
+  two cases applies:
+* **Converted frame black, raw data present**: the client is reading the
+  server's bytes with the wrong format. The client already prefers a native
+  32bpp format; `--server-format` additionally accepts a native 16bpp format.
+  If it is still black, send the `-V` format/raw-pixel lines.
+* **Converted frame black, raw data effectively empty**: the server is sending
+  a blank desktop. Common causes are a locked session, TightVNC attached to a
+  disconnected RDP/service session, Desktop Duplication returning black
+  frames, or a headless machine with no monitor/display attached. Check the
+  TightVNC server log and its session/desktop-duplication settings, and try
+  another VNC viewer from the same client machine to confirm it is server-side.
+
+For a minimal, conservative negotiation use `--safe-mode`:
+
+```sh
+./vnt -V --safe-mode <host>:5900
+```
+
+This forces raw encoding, requests the server's native pixel format, and
+disables JPEG/compression. It does not force RFB 3.3 (libvncclient does not
+expose a protocol-version override), but it removes the Tight/ZRLE decoders,
+format translation, and JPEG from the equation.
+
+Collect the transcript with:
+
+```sh
+./vnt -V host:5900 2>vnt-negotiation.log
 ```
 
 Keyboard and mouse input are forwarded to the remote desktop. Mouse events
@@ -138,12 +205,16 @@ libraries themselves:
 
 ### 1. Pixel format
 
-`rfbGetClient(8, 3, 4)` already gives the layout we want (32 bpp, depth 24,
-little endian, R/G/B/X bytes in memory). The client re-asserts it with
-`SetFormatAndEncodings()` so that the server converts to it. The conversion
-from the framebuffer to RGB24 is then a straight byte drop, with a generic
-fallback using the `redShift`/`redMax` fields so that it keeps working if a
-server forces a different format.
+`rfbGetClient(8, 3, 4)` gives a 32 bpp, little endian R/G/B/X fallback. The
+`MallocFrameBuffer` hook runs after `ServerInit` and before the pixel format
+is sent, so the client adopts the server's native 32 bpp format when it has
+one (as other viewers do). This avoids asking the server to translate every
+rectangle, which some servers mishandle. For 16 bpp natives the client keeps
+its 32 bpp request unless `--server-format` is given. `rfbInitClient()` sends
+the format and encodings itself; they are deliberately not sent a second time
+while the first update is in flight. The conversion from the framebuffer to
+RGB24 is a byte drop for R/G/B/X, with a generic fallback using the
+`redShift`/`redMax` fields for every other layout.
 
 ### 2. Sixel palette reuse
 
@@ -164,9 +235,9 @@ and would otherwise force us to re-send the palette every frame.
 
 libvncclient delivers a full screen refresh as several update messages (the
 server's update buffer is finite), and the first message may contain only a
-pseudo encoding (the ExtDesktopSize marker) with no pixels at all. The client
-therefore tracks which *rows* of the framebuffer have been received and only
-draws when the frame is complete (or when the server went quiet for 200 ms,
+pseudo encoding (a NewFBSize/ExtDesktopSize marker) with no pixels at all. The
+client therefore tracks which *rows* of the framebuffer have been received and
+only draws when the frame is complete (or when the server went quiet for 200 ms,
 so that a partial frame is still shown). `FinishedFrameBufferUpdate` is
 deliberately **not** used as the trigger: it fires for pseudo-encoding only
 messages too.
@@ -200,6 +271,51 @@ image is re-encoded at the new size.
   list. `--check` reports the result.
 * kitty does **not** support sixel - it uses its own kitty graphics
   protocol. The client ships a separate `--tmux` mode for passthrough.
+
+## TightVNC / Windows black-screen fix
+
+A 1920x1080 Windows desktop served by TightVNC connected but rendered black,
+while the same server worked in other VNC viewers. `-V` showed that TCP, RFB
+3.8 and authentication all completed, so the failure was in the pixel path.
+Because other viewers worked against the same server, the difference was
+client-side negotiation:
+
+* **The format/encodings message was sent twice.** `rfbInitClient()` already
+  calls `SetFormatAndEncodings()` and queues the first framebuffer update. The
+  client then sent it again while that update was in flight. TightVNC can
+  reset its encoder state at that point, corrupting the first frame; on a
+  static desktop no later full frame arrives to repair it. The duplicate call
+  has been removed.
+* **`NewFBSize` was not advertised.** libvncclient announces `ExtDesktopSize`
+  (`-308`) by default, but TightVNC only understands the classic `NewFBSize`
+  (`-223`). Without it, TightVNC treats every full-screen request as a
+  desktop-resize-disabled case and composites the desktop through a temporary
+  blank framebuffer. The client now sets `canHandleNewFBSize = TRUE`.
+* **32bpp RGBX was forced.** TightVNC's native format is 32bpp BGRX
+  (`redShift=16`, `greenShift=8`, `blueShift=0`), while the client requested
+  RGBX (`0/8/16`), forcing server-side translation. The `MallocFrameBuffer`
+  hook now runs after ServerInit and adopts the server's native 32bpp format.
+  `--server-format` additionally accepts a native 16bpp format.
+
+Diagnostics added while tracking this down:
+
+* `-V` captures and prefixes libvncclient's full handshake transcript and
+  reports the negotiated protocol version, security scheme, server/client
+  pixel formats, encodings, and the last libvncclient error.
+* Completed frames are classified as effectively black (less than 0.1%
+  non-black pixels). The client requests up to two full refreshes, then says
+  whether the raw framebuffer contained data or was effectively empty.
+* `-V` logs the server's native pixel format and raw pixel samples from
+  several points in the framebuffer, distinguishing a format-conversion bug
+  from a server that is actually sending black pixels.
+* `--safe-mode` forces raw encoding and the server-native pixel format and
+  disables JPEG/compression, for a minimal negotiation.
+* `--dump-ppm` writes the converted framebuffer and `--dump` writes the sixel
+  stream, so the received image and the rendered output can be compared
+  offline.
+
+See [Connection troubleshooting](#connection-troubleshooting) for how to read
+the black-frame warnings.
 
 ## License
 

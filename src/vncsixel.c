@@ -22,6 +22,7 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,6 +79,17 @@ typedef struct {
 
     long last_update_ms;
 
+    /* Framebuffer / connection diagnostics. */
+    long connect_ms;
+    unsigned long update_messages;
+    unsigned long rects_received;
+    unsigned long long pixels_received;
+    int black_checked;
+    int black_refresh_requests;
+    int black_warning_printed;
+    int no_update_warning_printed;
+    int raw_pixels_logged;
+
     const char *ppm_path; /* if set, write the received framebuffer here */
     FILE *ppm;
 } viewer_t;
@@ -93,6 +105,20 @@ static int g_center = 0;
 static int g_mouse_offset_x = 0;
 static int g_mouse_offset_y = 0;
 
+/*
+ * Connection diagnostics. These are only used by -V/--verbose; the normal
+ * output path is unchanged.
+ */
+static const char *g_username = NULL;
+static int g_password_attempted = 0;
+static int g_credential_attempted = 0;
+static int g_use_server_format = 0;
+static int g_safe_mode = 0;
+static int g_native_format_logged = 0;
+static rfbBool (*g_default_malloc_frame_buffer)(rfbClient *) = NULL;
+static char g_last_libvnc_message[512];
+static char g_last_libvnc_error[512];
+
 static void on_sigwinch(int sig)
 {
     (void)sig;
@@ -103,6 +129,215 @@ static void on_interrupt(int sig)
 {
     (void)sig;
     g_interrupted = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Connection / negotiation diagnostics                               */
+/* ------------------------------------------------------------------ */
+
+static void vlog(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!g_verbose) {
+        return;
+    }
+
+    fputs(PROG ": ", stderr);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+static const char *security_type_name(uint32_t type)
+{
+    switch (type) {
+    case rfbNoAuth:          return "None";
+    case rfbVncAuth:         return "VNC authentication";
+    case rfbRA2:             return "RA2";
+    case rfbRA2ne:           return "RA2ne";
+    case rfbTight:           return "Tight";
+    case rfbUltra:           return "Ultra";
+    case rfbTLS:             return "Anonymous TLS";
+    case rfbVeNCrypt:        return "VeNCrypt";
+#ifdef rfbSASL
+    case rfbSASL:            return "SASL";
+#endif
+    case rfbARD:             return "Apple Remote Desktop";
+    case rfbUltraMSLogonI:   return "UltraVNC MS-Logon I";
+    case rfbUltraMSLogonII:  return "UltraVNC MS-Logon II";
+    case rfbMSLogon:         return "MS-Logon";
+    default:                 return "unknown";
+    }
+}
+
+static const char *sub_auth_name(uint32_t type)
+{
+    switch (type) {
+    case rfbVeNCryptPlain:    return "Plain";
+    case rfbVeNCryptTLSNone:  return "TLSNone";
+    case rfbVeNCryptTLSVNC:   return "TLSVNC";
+    case rfbVeNCryptTLSPlain: return "TLSPlain";
+    case rfbVeNCryptX509None: return "X509None";
+    case rfbVeNCryptX509VNC:  return "X509VNC";
+    case rfbVeNCryptX509Plain:return "X509Plain";
+#ifdef rfbVeNCryptX509SASL
+    case rfbVeNCryptX509SASL: return "X509SASL";
+#endif
+#ifdef rfbVeNCryptTLSSASL
+    case rfbVeNCryptTLSSASL:  return "TLSSASL";
+#endif
+    default:                  return "unknown/none";
+    }
+}
+
+static void log_pixel_format(const char *label, const rfbPixelFormat *fmt)
+{
+    vlog("%s: %d bpp, depth %d, %s endian, %s colour, "
+         "max %u/%u/%u, shift %u/%u/%u",
+         label, (unsigned)fmt->bitsPerPixel, (unsigned)fmt->depth,
+         fmt->bigEndian ? "big" : "little",
+         fmt->trueColour ? "true" : "palette",
+         (unsigned)fmt->redMax, (unsigned)fmt->greenMax,
+         (unsigned)fmt->blueMax,
+         (unsigned)fmt->redShift, (unsigned)fmt->greenShift,
+         (unsigned)fmt->blueShift);
+}
+
+static void log_negotiated_security(const rfbClient *client)
+{
+    if (client->authScheme == rfbVeNCrypt) {
+        vlog("security: %s (%u), sub-auth %s (%u)",
+             security_type_name(client->authScheme),
+             (unsigned)client->authScheme,
+             sub_auth_name(client->subAuthScheme),
+             (unsigned)client->subAuthScheme);
+    } else {
+        vlog("security: %s (%u)",
+             security_type_name(client->authScheme),
+             (unsigned)client->authScheme);
+    }
+}
+
+/* Strip trailing newlines so the two log hooks can always add exactly one. */
+static void format_libvnc_message(char *buf, size_t buflen,
+                                  const char *fmt, va_list ap)
+{
+    int n;
+
+    if (buflen == 0) {
+        return;
+    }
+    n = vsnprintf(buf, buflen, fmt, ap);
+    if (n < 0) {
+        buf[0] = '\0';
+        return;
+    }
+    if ((size_t)n >= buflen) {
+        n = (int)buflen - 1;
+    }
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
+        buf[--n] = '\0';
+    }
+}
+
+static void libvnc_log_common(const char *fmt, va_list ap, int is_error)
+{
+    char buf[1024];
+
+    format_libvnc_message(buf, sizeof(buf), fmt, ap);
+
+    snprintf(g_last_libvnc_message, sizeof(g_last_libvnc_message), "%s", buf);
+    if (is_error) {
+        snprintf(g_last_libvnc_error, sizeof(g_last_libvnc_error), "%s", buf);
+    }
+
+    if (!g_verbose) {
+        return;
+    }
+
+    fprintf(stderr, PROG ": libvnc%s: %s\n", is_error ? " error" : "", buf);
+    fflush(stderr);
+}
+
+static void libvnc_log(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    libvnc_log_common(fmt, ap, 0);
+    va_end(ap);
+}
+
+static void libvnc_error(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    libvnc_log_common(fmt, ap, 1);
+    va_end(ap);
+}
+
+static char *dup_string(const char *s)
+{
+    size_t len;
+    char *copy;
+
+    if (s == NULL) {
+        return NULL;
+    }
+    len = strlen(s);
+    copy = (char *)malloc(len + 1);
+    if (copy != NULL) {
+        memcpy(copy, s, len + 1);
+    }
+    return copy;
+}
+
+/*
+ * Read one line from stdin. If the prompt is non-NULL, echo is disabled
+ * while it is read and the prompt is written to stderr.
+ */
+static char *read_line(const char *prompt)
+{
+    char buf[128];
+    size_t len;
+    struct termios saved, raw;
+    int have_termios = 0;
+
+    if (prompt != NULL) {
+        fprintf(stderr, "%s", prompt);
+        fflush(stderr);
+
+        if (tcgetattr(STDIN_FILENO, &saved) == 0) {
+            have_termios = 1;
+            raw = saved;
+            raw.c_lflag &= ~(unsigned int)(ECHO | ECHONL);
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+        } else if (g_verbose) {
+            vlog("stdin is not a terminal; reading without echo suppression");
+        }
+    }
+
+    if (fgets(buf, sizeof(buf), stdin) == NULL) {
+        buf[0] = '\0';
+    }
+
+    if (have_termios) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+    }
+    if (prompt != NULL) {
+        fprintf(stderr, "\n");
+    }
+
+    len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+        buf[--len] = '\0';
+    }
+
+    return dup_string(buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -144,6 +379,8 @@ static void got_framebuffer_update(rfbClient *client, int x, int y, int w, int h
 
     view->pixels_dirty = 1;
     view->last_update_ms = now_ms();
+    view->rects_received++;
+    view->pixels_received += (unsigned long long)w * (unsigned long long)h;
 
     if (g_verbose) {
         fprintf(stderr, PROG ": rect update %dx%d at (%d,%d), rows covered %d/%d\n",
@@ -153,7 +390,11 @@ static void got_framebuffer_update(rfbClient *client, int x, int y, int w, int h
 
 static void finished_framebuffer_update(rfbClient *client)
 {
-    (void)client;
+    viewer_t *view = (viewer_t *)rfbClientGetClientData(client, client);
+
+    if (view != NULL) {
+        view->update_messages++;
+    }
     /* The screen is updated, but it may not be complete - see the row
      * coverage tracking in got_framebuffer_update(). */
 }
@@ -164,47 +405,124 @@ static void finished_framebuffer_update(rfbClient *client)
 static char *password_getter(rfbClient *client)
 {
     char *pw;
-    char buf[128];
-    size_t len;
-    struct termios saved, raw;
-    int have_termios = 0;
 
     (void)client;
 
-    fprintf(stderr, "Password: ");
-    fflush(stderr);
+    g_password_attempted = 1;
+    vlog("server requested a VNC password; prompting on stdin");
 
-    /*
-     * Disable echo while reading the password so that it is not displayed
-     * on the terminal. Restore the original settings afterwards.
-     */
-    if (tcgetattr(STDIN_FILENO, &saved) == 0) {
-        have_termios = 1;
-        raw = saved;
-        raw.c_lflag &= ~(unsigned int)(ECHO | ECHONL);
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-    }
-
-    if (fgets(buf, sizeof(buf), stdin) == NULL) {
-        buf[0] = '\0';
-    }
-
-    if (have_termios) {
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
-    }
-
-    len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-        buf[--len] = '\0';
-    }
-    fprintf(stderr, "\n");
-
-    pw = (char *)malloc(len + 1);
+    pw = read_line("Password: ");
     if (pw == NULL) {
+        vlog("failed to read the password");
         return NULL;
     }
-    memcpy(pw, buf, len + 1);
+
+    vlog("read a %zu-byte password%s", strlen(pw),
+         pw[0] == '\0' ? " (empty!)" : "");
     return pw;
+}
+
+/*
+ * Credential callback for security types that carry a user name and password
+ * inside the protocol (VeNCrypt, MS-Logon, Apple Remote Desktop, ...).
+ *
+ * libvncclient only considers these security types when this callback is set,
+ * so it is installed only when --user is given. That keeps the default
+ * security-type selection exactly as before.
+ */
+static rfbCredential *credential_getter(rfbClient *client, int credentialType)
+{
+    rfbCredential *cred;
+
+    (void)client;
+
+    g_credential_attempted = 1;
+
+    if (credentialType == rfbCredentialTypeX509) {
+        fprintf(stderr, PROG ": the server requested an X.509 client "
+                "certificate, which this client does not support\n");
+        vlog("credential request: X.509 (unsupported, refusing)");
+        return NULL;
+    }
+    if (credentialType != rfbCredentialTypeUser) {
+        fprintf(stderr, PROG ": the server requested unknown credential "
+                "type %d\n", credentialType);
+        return NULL;
+    }
+
+    vlog("server requested user name + password credentials "
+         "(VeNCrypt/MS-Logon/ARD style authentication)");
+
+    if (g_username == NULL) {
+        vlog("no user name available; refusing the credential request");
+        return NULL;
+    }
+
+    cred = (rfbCredential *)calloc(1, sizeof(*cred));
+    if (cred == NULL) {
+        vlog("out of memory while building credentials");
+        return NULL;
+    }
+
+    cred->userCredential.username = dup_string(g_username);
+    cred->userCredential.password = read_line("Password: ");
+
+    if (cred->userCredential.username == NULL ||
+        cred->userCredential.password == NULL) {
+        vlog("failed to read the user credentials");
+        free(cred->userCredential.username);
+        free(cred->userCredential.password);
+        free(cred);
+        return NULL;
+    }
+
+    vlog("supplied user name '%s' and a %zu-byte password",
+         cred->userCredential.username,
+         strlen(cred->userCredential.password));
+    return cred;
+}
+
+/*
+ * libvncclient calls this after ServerInit (so client->si.format is known)
+ * but before it sends SetPixelFormat. That gives us a chance to see the
+ * server's native format, and optionally ask for it instead of forcing a
+ * translation to the 32bpp RGBX format.
+ */
+static rfbBool malloc_frame_buffer(rfbClient *client)
+{
+    if (g_verbose && !g_native_format_logged) {
+        g_native_format_logged = 1;
+        log_pixel_format("server native pixel format", &client->si.format);
+        log_pixel_format("currently requested client format", &client->format);
+    }
+
+    /*
+     * Prefer the server's native 32bpp format by default. This is what
+     * other viewers normally do and it avoids asking the server to run a
+     * pixel-format translation for every rectangle; some servers (notably
+     * TightVNC) produce black output on some translation paths. For 16bpp
+     * we keep the requested 32bpp format unless --server-format was given,
+     * so we do not silently lose colour depth.
+     */
+    if (g_use_server_format ||
+        (client->si.format.trueColour &&
+         client->si.format.bitsPerPixel == 32)) {
+        if (client->si.format.bitsPerPixel == 16 ||
+            client->si.format.bitsPerPixel == 32) {
+            client->format = client->si.format;
+            vlog("using the server's native %d bpp pixel format",
+                 client->si.format.bitsPerPixel);
+        } else {
+            vlog("server native format is %d bpp, which is not supported "
+                 "without a colour map; keeping the requested format",
+                 client->si.format.bitsPerPixel);
+        }
+    }
+
+    if (g_default_malloc_frame_buffer == NULL) {
+        return FALSE;
+    }
+    return g_default_malloc_frame_buffer(client);
 }
 
 /* ------------------------------------------------------------------ */
@@ -291,6 +609,108 @@ static void dump_ppm(viewer_t *v, const uint8_t *rgb, int w, int h)
         }
     }
     fflush(f);
+}
+
+/*
+ * Classify a frame as "effectively black". A real desktop usually has at
+ * least a mouse cursor or a window border somewhere, so treat a frame with
+ * less than 0.1% non-black pixels as blank. Values below 8 are treated as
+ * black to tolerate JPEG ringing around a black background.
+ */
+static int framebuffer_is_effectively_black(const uint8_t *rgb,
+                                            size_t pixels,
+                                            unsigned long *non_black_out)
+{
+    unsigned long non_black = 0;
+    size_t i;
+
+    for (i = 0; i < pixels; i++) {
+        const uint8_t *p = rgb + i * 3;
+        if (p[0] > 8 || p[1] > 8 || p[2] > 8) {
+            non_black++;
+        }
+    }
+
+    if (non_black_out != NULL) {
+        *non_black_out = non_black;
+    }
+    return non_black <= pixels / 1000;
+}
+
+/*
+ * Return true if the raw framebuffer contains any non-zero byte. Used to
+ * distinguish "the server sent black pixels" from "the server sent data
+ * that we decoded as black because the pixel format was misread".
+ */
+static int framebuffer_raw_has_data(const rfbClient *client)
+{
+    int bpp = client->format.bitsPerPixel / 8;
+    size_t pixels, i;
+    size_t non_zero = 0;
+
+    if (client->frameBuffer == NULL) {
+        return 0;
+    }
+    if (bpp < 1 || bpp > 4) {
+        /* Unknown layout: do not claim the data is empty. */
+        return 1;
+    }
+
+    pixels = (size_t)client->width * (size_t)client->height;
+    for (i = 0; i < pixels; i++) {
+        const uint8_t *p = client->frameBuffer + i * (size_t)bpp;
+        int j;
+        for (j = 0; j < bpp; j++) {
+            if (p[j] > 8) {
+                non_zero++;
+                break;
+            }
+        }
+    }
+
+    return non_zero > pixels / 1000;
+}
+
+/*
+ * Log raw (still server-encoded) pixel words from several places in the
+ * framebuffer. If these are non-zero while the converted RGB image is black,
+ * the negotiated pixel format is being misread.
+ */
+static void log_raw_pixel_samples(viewer_t *v)
+{
+    rfbClient *client = v->client;
+    int bpp = client->format.bitsPerPixel / 8;
+    size_t pixels = (size_t)client->width * (size_t)client->height;
+    size_t sample[4];
+    int i, j;
+    char line[256];
+    size_t used = 0;
+
+    v->raw_pixels_logged = 1;
+    if (bpp < 1 || bpp > 4) {
+        bpp = 4;
+    }
+    if (pixels == 0) {
+        return;
+    }
+
+    sample[0] = 0;
+    sample[1] = pixels / 3;
+    sample[2] = (2 * pixels) / 3;
+    sample[3] = pixels - 1;
+
+    used += (size_t)snprintf(line + used, sizeof(line) - used, "bpp=%d", bpp * 8);
+    for (i = 0; i < 4 && used < sizeof(line); i++) {
+        used += (size_t)snprintf(line + used, sizeof(line) - used,
+                                 " | [%zu]", sample[i]);
+        for (j = 0; j < bpp && used < sizeof(line); j++) {
+            used += (size_t)snprintf(line + used, sizeof(line) - used,
+                                     " %02x",
+                                     client->frameBuffer[sample[i] * (size_t)bpp +
+                                                         (size_t)j]);
+        }
+    }
+    vlog("raw framebuffer samples: %s", line);
 }
 
 static int render(viewer_t *v, int upscale)
@@ -673,7 +1093,13 @@ static void usage(void)
         "                         requires a terminal with a shared colour register bank)\n"
         "      --dump FILE        write the sixel stream to FILE instead of the terminal\n"
         "      --dump-ppm FILE    write the received framebuffer to FILE as a PPM\n"
-        "  -V, --verbose           print scaling information\n"
+        "  -U, --user NAME        user name for servers that need VeNCrypt/MS-Logon/\n"
+        "                         ARD credentials (the password is prompted for)\n"
+        "      --server-format    request the server's native pixel format instead\n"
+        "                         of forcing 32bpp RGBX (diagnostic fallback)\n"
+        "      --safe-mode        debugging profile: force raw encoding, the\n"
+        "                         server's native pixel format, and no JPEG\n"
+        "  -V, --verbose           print scaling, connection and negotiation details\n"
         "      --debug-mouse       print mouse coordinate mapping to stderr\n"
         "      --draw-cursor       draw a visible marker on the image at the\n"
         "                          mapped mouse position (for debugging)\n"
@@ -695,6 +1121,7 @@ int main(int argc, char **argv)
     viewer_t v;
     const char *host = NULL;
     const char *encodings = "tight zrle hextile raw copyrect";
+    int encodings_set = 0;
     const char *dump_path = NULL;
     const char *ppm_path = NULL;
     const char *quality = "size";
@@ -728,6 +1155,7 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "-e") == 0 || strcmp(a, "--encodings") == 0) {
             if (++i >= argc) { usage(); return 1; }
             encodings = argv[i];
+            encodings_set = 1;
         } else if (strcmp(a, "-c") == 0 || strcmp(a, "--colors") == 0) {
             if (++i >= argc) { usage(); return 1; }
             ncolors = atoi(argv[i]);
@@ -788,6 +1216,13 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "--frames") == 0) {
             if (++i >= argc) { usage(); return 1; }
             max_frames = atoi(argv[i]);
+        } else if (strcmp(a, "-U") == 0 || strcmp(a, "--user") == 0) {
+            if (++i >= argc) { usage(); return 1; }
+            g_username = argv[i];
+        } else if (strcmp(a, "--server-format") == 0) {
+            g_use_server_format = 1;
+        } else if (strcmp(a, "--safe-mode") == 0) {
+            g_safe_mode = 1;
         } else if (strcmp(a, "-V") == 0 || strcmp(a, "--verbose") == 0) {
             g_verbose = 1;
         } else if (strcmp(a, "--check") == 0) {
@@ -825,6 +1260,15 @@ int main(int argc, char **argv)
 
     v.ppm_path = ppm_path;
 
+    if (g_safe_mode) {
+        if (!encodings_set) {
+            encodings = "raw";
+        }
+        g_use_server_format = 1;
+        fprintf(stderr, PROG ": safe mode: encoding '%s', "
+                "server-native pixel format, JPEG disabled\n", encodings);
+    }
+
     if (strcmp(quality, "auto") == 0) {
         encode_policy = SIXEL_ENCODEPOLICY_AUTO;
     } else if (strcmp(quality, "fast") == 0) {
@@ -857,11 +1301,33 @@ int main(int argc, char **argv)
     }
 
     /* ---- libvncclient ---- */
+    if (g_verbose) {
+        /*
+         * libvncclient logs the whole handshake (protocol version, offered
+         * security types, selected scheme, authentication result and the
+         * server's default pixel format) through these hooks. Prefix the
+         * messages ourselves and keep the last one so that a failed
+         * rfbInitClient() can report the reason.
+         */
+        rfbEnableClientLogging = TRUE;
+        rfbClientLog = libvnc_log;
+        rfbClientErr = libvnc_error;
+        vlog("libvncclient negotiation diagnostics enabled");
+    }
+    vlog("allocating VNC client");
     v.client = rfbGetClient(8, 3, 4);
     if (v.client == NULL) {
         fprintf(stderr, PROG ": failed to allocate the VNC client\n");
         return 1;
     }
+
+    /*
+     * The framebuffer allocation hook runs after ServerInit but before the
+     * pixel format is sent, so it is the right place to inspect the server's
+     * native format and optionally use it.
+     */
+    g_default_malloc_frame_buffer = v.client->MallocFrameBuffer;
+    v.client->MallocFrameBuffer = malloc_frame_buffer;
 
     /*
      * Force 32 bit true colour. With bigEndian = 0 and these shifts the
@@ -883,7 +1349,27 @@ int main(int argc, char **argv)
     v.client->appData.viewOnly = view_only ? TRUE : FALSE;
     v.client->appData.shareDesktop = TRUE;
     v.client->appData.useRemoteCursor = FALSE; /* server draws the cursor */
+
+    /*
+     * Advertise the classic NewFBSize pseudo-encoding (-223). TightVNC's
+     * server understands this but not ExtDesktopSize (-308), which is all
+     * libvncclient sends by default. Without -223 TightVNC takes its
+     * "desktop resize disabled" fallback for every full-screen request,
+     * compositing the desktop into a temporary blank framebuffer. That path
+     * is what some servers mishandle for non-default pixel formats.
+     */
+    v.client->canHandleNewFBSize = TRUE;
+
+    if (g_safe_mode) {
+        v.client->appData.enableJPEG = FALSE;
+        v.client->appData.compressLevel = 0;
+        v.client->appData.qualityLevel = 0;
+    }
     v.client->GetPassword = password_getter;
+    if (g_username != NULL) {
+        v.client->GetCredential = credential_getter;
+        vlog("user name supplied; enabling credential-based security types");
+    }
 
     v.client->GotFrameBufferUpdate = got_framebuffer_update;
     v.client->FinishedFrameBufferUpdate = finished_framebuffer_update;
@@ -892,6 +1378,11 @@ int main(int argc, char **argv)
      * find the viewer state again.
      */
     rfbClientSetClientData(v.client, (void *)v.client, (void *)&v);
+
+    vlog("connecting to %s (encodings: %s, view-only: %s, shared: yes)",
+         host, encodings, view_only ? "yes" : "no");
+    vlog("handshake: TCP connect, RFB protocol version, security type, "
+         "authentication, ServerInit");
 
     {
         /* rfbInitClient() expects { program name, ..., host }. */
@@ -908,15 +1399,64 @@ int main(int argc, char **argv)
              * fails, so the client is already gone here.
              */
             fprintf(stderr, PROG ": failed to connect to %s\n", host);
+
+            if (g_verbose) {
+                if (g_last_libvnc_error[0] != '\0') {
+                    vlog("last libvncclient error: %s", g_last_libvnc_error);
+                }
+                if (g_last_libvnc_message[0] != '\0' &&
+                    strcmp(g_last_libvnc_message, g_last_libvnc_error) != 0) {
+                    vlog("last libvncclient message: %s",
+                         g_last_libvnc_message);
+                }
+
+                if (g_password_attempted || g_credential_attempted) {
+                    vlog("diagnosis: the server requested credentials, so "
+                         "the TCP connection and RFB protocol version were "
+                         "accepted; authentication is the likely failure");
+                    vlog("diagnosis: verify the password/user name and the "
+                         "server's authentication method");
+                } else {
+                    vlog("diagnosis: no credentials were requested; the "
+                         "failure happened during TCP connect, RFB protocol "
+                         "version negotiation, or security-type selection");
+                    if (g_username == NULL) {
+                        vlog("diagnosis: if the server only offers "
+                             "VeNCrypt/MS-Logon/ARD, retry with --user NAME");
+                    }
+                }
+            }
             return 1;
         }
     }
 
-    /* Re-assert our pixel format; the server has to convert to it. */
-    SetFormatAndEncodings(v.client);
+    vlog("RFB handshake complete: protocol %d.%d, server '%s', desktop '%s'",
+         v.client->major, v.client->minor,
+         v.client->serverHost != NULL ? v.client->serverHost : host,
+         v.client->desktopName != NULL ? v.client->desktopName : "(none)");
+    log_negotiated_security(v.client);
+    log_pixel_format("server pixel format", &v.client->format);
+
+    /*
+     * Do not call SetFormatAndEncodings() again here.
+     *
+     * rfbInitClient() -> rfbInitConnection() already calls it with the
+     * format and encodingsString configured above, and then sends the first
+     * FramebufferUpdateRequest. Sending a second SetPixelFormat/SetEncodings
+     * while the first update is in flight can make a server reset its
+     * encoder state mid-frame. If that corrupts the first Tight frame (often
+     * the whole screen), a static desktop may never send another update to
+     * repair it, leaving the viewer black. TightVNC servers are a known
+     * source of first-frame corruption in this situation.
+     */
+    vlog("pixel format and encodings were sent by rfbInitClient()");
+    log_pixel_format("requested pixel format", &v.client->format);
+    vlog("requested encodings: %s", encodings);
 
     fprintf(stderr, PROG ": connected to %s, desktop %dx%d\n", host,
             v.client->width, v.client->height);
+
+    v.connect_ms = now_ms();
 
     /* ---- sixel sink ---- */
     if (sixel_sink_init(&v.sink, v.out, ncolors, encode_policy,
@@ -1035,6 +1575,27 @@ int main(int argc, char **argv)
             /* The remote desktop was resized. */
             ensure_row_seen(&v, v.client->height);
             v.pixels_dirty = 1;
+            v.black_checked = 0;
+            v.black_refresh_requests = 0;
+            v.black_warning_printed = 0;
+        }
+
+        /*
+         * If no pixels arrive at all, the problem is in encoding negotiation
+         * or in the server, not in the sixel/rendering path. Say so instead
+         * of leaving the user with a silent black screen.
+         */
+        if (v.rects_received == 0 && !v.no_update_warning_printed &&
+            v.connect_ms > 0 && (nowms - v.connect_ms) > 5000) {
+            v.no_update_warning_printed = 1;
+            fprintf(stderr, PROG ": warning: no framebuffer updates received "
+                    "in the first 5 seconds.\n");
+            if (g_verbose) {
+                vlog("no pixels received; the server accepted the connection "
+                     "but is not sending usable framebuffer data");
+                vlog("check the encoding list and try '-e raw' to bypass the "
+                     "Tight/ZRLE decoders");
+            }
         }
 
         frame_complete = (v.rows_covered >= v.client->height);
@@ -1057,6 +1618,77 @@ int main(int argc, char **argv)
                 v.rendered_once = 1;
 
                 if (frame_complete) {
+                    if (g_verbose && !v.raw_pixels_logged) {
+                        log_raw_pixel_samples(&v);
+                    }
+
+                    if (!v.black_checked) {
+                        size_t fb_pixels = (size_t)v.client->width *
+                                           (size_t)v.client->height;
+                        unsigned long non_black = 0;
+                        int black = framebuffer_is_effectively_black(
+                            v.rgb, fb_pixels, &non_black);
+
+                        v.black_checked = 1;
+                        if (black) {
+                            int raw_has_data =
+                                framebuffer_raw_has_data(v.client);
+
+                            vlog("complete frame is effectively black: "
+                                 "%lu/%zu non-black pixels, raw data %s "
+                                 "(updates=%lu rects=%lu pixels=%llu)",
+                                 non_black, fb_pixels,
+                                 raw_has_data ? "present" : "effectively empty",
+                                 v.update_messages, v.rects_received,
+                                 v.pixels_received);
+
+                            if (v.black_refresh_requests < 2) {
+                                v.black_refresh_requests++;
+                                vlog("requesting a full non-incremental "
+                                     "refresh (%d/2) to recover the frame",
+                                     v.black_refresh_requests);
+                                SendFramebufferUpdateRequest(v.client, 0, 0,
+                                                             v.client->width,
+                                                             v.client->height,
+                                                             FALSE);
+                                /* Check the refreshed frame as well. */
+                                v.black_checked = 0;
+                            } else if (!v.black_warning_printed) {
+                                v.black_warning_printed = 1;
+                                if (raw_has_data) {
+                                    fprintf(stderr, PROG ": warning: the "
+                                            "converted frame is black, but the "
+                                            "raw framebuffer contains data.\n");
+                                    fprintf(stderr, PROG ": the pixel format "
+                                            "is probably being misapplied; "
+                                            "retry with '--server-format'.\n");
+                                } else {
+                                    fprintf(stderr, PROG ": warning: the "
+                                            "server is sending an all-black "
+                                            "framebuffer (the raw framebuffer "
+                                            "is effectively empty).\n");
+                                    fprintf(stderr, PROG ": the remote "
+                                            "session may be locked, TightVNC "
+                                            "may be capturing a different or "
+                                            "disconnected session, Desktop "
+                                            "Duplication may be returning "
+                                            "black frames, or the machine may "
+                                            "be headless.\n");
+                                }
+                                fprintf(stderr, PROG ": check the TightVNC "
+                                        "server log and try another VNC viewer "
+                                        "from this machine to confirm the "
+                                        "server side.\n");
+                            }
+                        } else if (g_verbose) {
+                            vlog("complete frame is not black: "
+                                 "%lu/%zu non-black pixels "
+                                 "(updates=%lu rects=%lu pixels=%llu)",
+                                 non_black, fb_pixels, v.update_messages,
+                                 v.rects_received, v.pixels_received);
+                        }
+                    }
+
                     /* Start tracking coverage for the next frame. */
                     memset(v.row_seen, 0, (size_t)v.row_seen_cap);
                     v.rows_covered = 0;
