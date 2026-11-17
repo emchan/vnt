@@ -45,7 +45,7 @@ def main():
 
         out = bytearray()
         frames = []
-        sent_mouse = sent_key = False
+        sent_mouse = sent_key = sent_backspace = False
         deadline = time.time() + 12
         quitting = False
         quit_deadline = 0.0
@@ -83,7 +83,12 @@ def main():
             elif sent_mouse and not sent_key and len(frames) >= 2:
                 os.write(fd, b"a")
                 sent_key = True
-            elif sent_key and len(frames) >= 4:
+            elif sent_key and not sent_backspace and len(frames) >= 3:
+                # Terminals send DEL for Backspace; it must reach the server
+                # as the X11 keysym XK_BackSpace.
+                os.write(fd, b"\x7f")
+                sent_backspace = True
+            elif sent_backspace and len(frames) >= 4:
                 os.write(fd, b"\x03")
                 quitting = True
                 quit_deadline = time.time() + 2.0
@@ -113,6 +118,13 @@ def main():
             print("  %-34s ok" % "keyboard event forwarded")
         else:
             print("  %-34s MISSING" % "keyboard event forwarded")
+            print("    server log: %r" % slog[-400:])
+            failed += 1
+
+        if "key down keysym=0xff08" in slog:
+            print("  %-34s ok" % "backspace mapped to XK_BackSpace")
+        else:
+            print("  %-34s MISSING" % "backspace mapped to XK_BackSpace")
             print("    server log: %r" % slog[-400:])
             failed += 1
 

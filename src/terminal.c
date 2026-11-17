@@ -566,9 +566,15 @@ static int decode_event(term_event_t *ev)
 
     if (c != 0x1b) {
         /* Plain key. Control characters map onto themselves, which matches
-         * the X11 keysym values for Ctrl+A .. Ctrl+Z. */
+         * the X11 keysym values for Ctrl+A .. Ctrl+Z. Terminals send DEL
+         * (0x7f) or BS (0x08) for Backspace, but VNC servers expect the
+         * X11 keysym XK_BackSpace, so translate those explicitly. */
         ev->kind = TERM_EV_KEY;
-        ev->keysym = (uint32_t)c;
+        if (c == 0x7f || c == 0x08) {
+            ev->keysym = KEY_BACKSPACE;
+        } else {
+            ev->keysym = (uint32_t)c;
+        }
         return 1;
     }
 
