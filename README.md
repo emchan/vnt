@@ -97,6 +97,10 @@ vnt [options] host[:port]
                          (native 32bpp is already preferred automatically)
       --safe-mode        debugging profile: raw encoding, server-native pixel
                          format, JPEG/compression disabled
+      --force-rgbx       keep the requested 32bpp RGBX format instead of the
+                         server's native format (for A/B testing)
+      --no-jpeg          keep Tight encoding but disable its JPEG mode
+      --version          print build and library versions
   -V, --verbose          print scaling, connection and negotiation details
 ```
 
@@ -128,9 +132,10 @@ Typical failures:
   `NewFBSize` pseudo-encoding, which keeps TightVNC off its full-screen
   fallback path, and forces a full refresh up to twice, because a corrupted
   first frame would otherwise stay black until the desktop changes. If the
-  warning persists, try `-e raw` to bypass the Tight/ZRLE decoders and
-  `--dump-ppm frame.ppm` to inspect what the server actually sent. `-V` also
-  logs the server's native pixel format
+  frame is still black it retries Tight with JPEG disabled, then falls back to
+  raw encoding. If the warning persists, try `-e raw` to bypass the
+  Tight/ZRLE decoders and `--dump-ppm frame.ppm` to inspect what the server
+  actually sent. `-V` also logs the server's native pixel format
   and raw pixel samples. The warning after the retries states which of the
   two cases applies:
 * **Converted frame black, raw data present**: the client is reading the
@@ -143,6 +148,13 @@ Typical failures:
   frames, or a headless machine with no monitor/display attached. Check the
   TightVNC server log and its session/desktop-duplication settings, and try
   another VNC viewer from the same client machine to confirm it is server-side.
+* **Works on one architecture but is black on another**: RFB itself does not
+  depend on the CPU, so compare the builds and terminals. Run `--version` on
+  both (it prints the build date, byte order and libvncclient headers),
+  `--check` on the failing one, and compare the `-V` format/raw-pixel lines.
+  A stale binary, a different libvncclient/libsixel build, and a terminal
+  without sixel support are the usual causes. `--force-rgbx` and
+  `--safe-mode` isolate the pixel-format and encoding paths.
 
 For a minimal, conservative negotiation use `--safe-mode`:
 
@@ -303,8 +315,10 @@ Diagnostics added while tracking this down:
   reports the negotiated protocol version, security scheme, server/client
   pixel formats, encodings, and the last libvncclient error.
 * Completed frames are classified as effectively black (less than 0.1%
-  non-black pixels). The client requests up to two full refreshes, then says
-  whether the raw framebuffer contained data or was effectively empty.
+  non-black pixels). The client requests up to two full refreshes, retries
+  Tight with JPEG disabled, and finally falls back to raw encoding before
+  reporting whether the raw framebuffer contained data or was effectively
+  empty.
 * `-V` logs the server's native pixel format and raw pixel samples from
   several points in the framebuffer, distinguishing a format-conversion bug
   from a server that is actually sending black pixels.

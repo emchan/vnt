@@ -32,6 +32,7 @@
 
 #include <rfb/rfbclient.h>
 #include <rfb/keysym.h>
+#include <rfb/rfbconfig.h>
 
 #include "scaler.h"
 #include "sixel_out.h"
@@ -89,6 +90,9 @@ typedef struct {
     int black_warning_printed;
     int no_update_warning_printed;
     int raw_pixels_logged;
+    int raw_fallback_allowed;
+    int raw_fallback_done;
+    int jpeg_fallback_done;
 
     const char *ppm_path; /* if set, write the received framebuffer here */
     FILE *ppm;
@@ -113,7 +117,9 @@ static const char *g_username = NULL;
 static int g_password_attempted = 0;
 static int g_credential_attempted = 0;
 static int g_use_server_format = 0;
+static int g_force_rgbx = 0;
 static int g_safe_mode = 0;
+static int g_no_jpeg = 0;
 static int g_native_format_logged = 0;
 static rfbBool (*g_default_malloc_frame_buffer)(rfbClient *) = NULL;
 static char g_last_libvnc_message[512];
@@ -241,6 +247,30 @@ static void format_libvnc_message(char *buf, size_t buflen,
     while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
         buf[--n] = '\0';
     }
+}
+
+/* Bounded append helper: never lets `used` run past the buffer. */
+static size_t append_limited(char *buf, size_t size, size_t used,
+                             const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    if (size == 0 || used >= size - 1) {
+        return size == 0 ? 0 : size - 1;
+    }
+
+    va_start(ap, fmt);
+    n = vsnprintf(buf + used, size - used, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) {
+        return used;
+    }
+    if ((size_t)n >= size - used) {
+        return size - 1;
+    }
+    return used + (size_t)n;
 }
 
 static void libvnc_log_common(const char *fmt, va_list ap, int is_error)
@@ -504,9 +534,10 @@ static rfbBool malloc_frame_buffer(rfbClient *client)
      * we keep the requested 32bpp format unless --server-format was given,
      * so we do not silently lose colour depth.
      */
-    if (g_use_server_format ||
-        (client->si.format.trueColour &&
-         client->si.format.bitsPerPixel == 32)) {
+    if (!g_force_rgbx &&
+        (g_use_server_format ||
+         (client->si.format.trueColour &&
+          client->si.format.bitsPerPixel == 32))) {
         if (client->si.format.bitsPerPixel == 16 ||
             client->si.format.bitsPerPixel == 32) {
             client->format = client->si.format;
@@ -517,6 +548,8 @@ static rfbBool malloc_frame_buffer(rfbClient *client)
                  "without a colour map; keeping the requested format",
                  client->si.format.bitsPerPixel);
         }
+    } else if (g_force_rgbx) {
+        vlog("keeping the forced 32bpp RGBX pixel format");
     }
 
     if (g_default_malloc_frame_buffer == NULL) {
@@ -699,15 +732,13 @@ static void log_raw_pixel_samples(viewer_t *v)
     sample[2] = (2 * pixels) / 3;
     sample[3] = pixels - 1;
 
-    used += (size_t)snprintf(line + used, sizeof(line) - used, "bpp=%d", bpp * 8);
-    for (i = 0; i < 4 && used < sizeof(line); i++) {
-        used += (size_t)snprintf(line + used, sizeof(line) - used,
-                                 " | [%zu]", sample[i]);
-        for (j = 0; j < bpp && used < sizeof(line); j++) {
-            used += (size_t)snprintf(line + used, sizeof(line) - used,
-                                     " %02x",
-                                     client->frameBuffer[sample[i] * (size_t)bpp +
-                                                         (size_t)j]);
+    used = append_limited(line, sizeof(line), used, "bpp=%d", bpp * 8);
+    for (i = 0; i < 4; i++) {
+        used = append_limited(line, sizeof(line), used, " | [%zu]", sample[i]);
+        for (j = 0; j < bpp; j++) {
+            used = append_limited(line, sizeof(line), used, " %02x",
+                                  client->frameBuffer[sample[i] * (size_t)bpp +
+                                                      (size_t)j]);
         }
     }
     vlog("raw framebuffer samples: %s", line);
@@ -1075,6 +1106,25 @@ static void send_mouse(viewer_t *v, const term_event_t *ev)
 /* main                                                               */
 /* ------------------------------------------------------------------ */
 
+static void print_version(void)
+{
+    printf(PROG " build information\n");
+    printf("  built: %s %s\n", __DATE__, __TIME__);
+    printf("  compiler: %s\n", __VERSION__);
+    printf("  pointer size: %u-bit\n", (unsigned)(sizeof(void *) * 8));
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    defined(__ORDER_BIG_ENDIAN__)
+    printf("  byte order: %s\n",
+           __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? "little" : "big");
+#endif
+#ifdef LIBVNCSERVER_VERSION
+    printf("  libvncclient headers: %s\n", LIBVNCSERVER_VERSION);
+#endif
+#ifdef LIBSIXEL_VERSION
+    printf("  libsixel headers: %s\n", LIBSIXEL_VERSION);
+#endif
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -1095,10 +1145,14 @@ static void usage(void)
         "      --dump-ppm FILE    write the received framebuffer to FILE as a PPM\n"
         "  -U, --user NAME        user name for servers that need VeNCrypt/MS-Logon/\n"
         "                         ARD credentials (the password is prompted for)\n"
-        "      --server-format    request the server's native pixel format instead\n"
-        "                         of forcing 32bpp RGBX (diagnostic fallback)\n"
+        "      --server-format    also accept the server's native 16bpp format\n"
+        "                         (native 32bpp is preferred automatically)\n"
         "      --safe-mode        debugging profile: force raw encoding, the\n"
         "                         server's native pixel format, and no JPEG\n"
+        "      --force-rgbx       keep the requested 32bpp RGBX format instead\n"
+        "                         of using the server's native format\n"
+        "      --no-jpeg          keep Tight encoding but disable its JPEG mode\n"
+        "      --version          print build and library versions\n"
         "  -V, --verbose           print scaling, connection and negotiation details\n"
         "      --debug-mouse       print mouse coordinate mapping to stderr\n"
         "      --draw-cursor       draw a visible marker on the image at the\n"
@@ -1151,6 +1205,9 @@ int main(int argc, char **argv)
 
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage();
+            return 0;
+        } else if (strcmp(a, "--version") == 0) {
+            print_version();
             return 0;
         } else if (strcmp(a, "-e") == 0 || strcmp(a, "--encodings") == 0) {
             if (++i >= argc) { usage(); return 1; }
@@ -1223,6 +1280,10 @@ int main(int argc, char **argv)
             g_use_server_format = 1;
         } else if (strcmp(a, "--safe-mode") == 0) {
             g_safe_mode = 1;
+        } else if (strcmp(a, "--force-rgbx") == 0) {
+            g_force_rgbx = 1;
+        } else if (strcmp(a, "--no-jpeg") == 0) {
+            g_no_jpeg = 1;
         } else if (strcmp(a, "-V") == 0 || strcmp(a, "--verbose") == 0) {
             g_verbose = 1;
         } else if (strcmp(a, "--check") == 0) {
@@ -1268,6 +1329,16 @@ int main(int argc, char **argv)
         fprintf(stderr, PROG ": safe mode: encoding '%s', "
                 "server-native pixel format, JPEG disabled\n", encodings);
     }
+
+    /*
+     * If a compressed encoding is in use, a black first frame may mean the
+     * decoder on this build is broken. Allow a one-time fallback to raw.
+     */
+    v.raw_fallback_allowed =
+        strstr(encodings, "tight") != NULL ||
+        strstr(encodings, "zrle") != NULL ||
+        strstr(encodings, "hextile") != NULL ||
+        strstr(encodings, "zlib") != NULL;
 
     if (strcmp(quality, "auto") == 0) {
         encode_policy = SIXEL_ENCODEPOLICY_AUTO;
@@ -1360,8 +1431,10 @@ int main(int argc, char **argv)
      */
     v.client->canHandleNewFBSize = TRUE;
 
-    if (g_safe_mode) {
+    if (g_no_jpeg || g_safe_mode) {
         v.client->appData.enableJPEG = FALSE;
+    }
+    if (g_safe_mode) {
         v.client->appData.compressLevel = 0;
         v.client->appData.qualityLevel = 0;
     }
@@ -1653,6 +1726,56 @@ int main(int argc, char **argv)
                                                              FALSE);
                                 /* Check the refreshed frame as well. */
                                 v.black_checked = 0;
+                            } else if (!v.jpeg_fallback_done &&
+                                       v.client->appData.enableJPEG) {
+                                /*
+                                 * Some libvncclient/libjpeg builds decode
+                                 * Tight's JPEG mode incorrectly. Tight without
+                                 * JPEG is still compressed and lossless, so
+                                 * try that before dropping to raw.
+                                 */
+                                v.jpeg_fallback_done = 1;
+                                vlog("still black after two refreshes; "
+                                     "disabling Tight JPEG mode");
+                                v.client->appData.enableJPEG = FALSE;
+                                v.client->appData.qualityLevel = 0;
+                                if (SetFormatAndEncodings(v.client)) {
+                                    SendFramebufferUpdateRequest(v.client, 0, 0,
+                                                                 v.client->width,
+                                                                 v.client->height,
+                                                                 FALSE);
+                                    v.black_checked = 0;
+                                    v.black_refresh_requests = 0;
+                                } else {
+                                    v.black_warning_printed = 1;
+                                    fprintf(stderr, PROG ": warning: failed "
+                                            "to renegotiate encodings without "
+                                            "JPEG\n");
+                                }
+                            } else if (v.raw_fallback_allowed &&
+                                       !v.raw_fallback_done) {
+                                /*
+                                 * The compressed decoder on this build may
+                                 * be broken. Raw is always supported and
+                                 * lets us confirm whether the frame itself
+                                 * is good.
+                                 */
+                                v.raw_fallback_done = 1;
+                                vlog("still black after disabling JPEG; "
+                                     "switching to raw encoding");
+                                v.client->appData.encodingsString = "raw";
+                                if (SetFormatAndEncodings(v.client)) {
+                                    SendFramebufferUpdateRequest(v.client, 0, 0,
+                                                                 v.client->width,
+                                                                 v.client->height,
+                                                                 FALSE);
+                                    v.black_checked = 0;
+                                    v.black_refresh_requests = 0;
+                                } else {
+                                    v.black_warning_printed = 1;
+                                    fprintf(stderr, PROG ": warning: failed "
+                                            "to switch to raw encoding\n");
+                                }
                             } else if (!v.black_warning_printed) {
                                 v.black_warning_printed = 1;
                                 if (raw_has_data) {
