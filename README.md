@@ -31,6 +31,8 @@ area, and emits a SIXEL image per frame. The terminal cursor is hidden and
 sixel display mode (DECSDM) is enabled so that every frame lands at the top
 left corner without scrolling.
 
+![vnt rendering a remote desktop in the terminal with the status bar](vnt.png)
+
 ## Quick start
 
 One line Docker command for testing in a sandbox:
